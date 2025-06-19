@@ -12,6 +12,8 @@ const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_ANON_KEY;
 const supabase = createClient(supabaseUrl, supabaseKey);
 const JWT_SECRET = process.env.JWT_SECRET || "secretkey123";
+const AI_SERVICE_URL =
+  process.env.AI_SERVICE_URL || "https://ai-budgeting-ai.domcloud.dev";
 app.use(express.json());
 app.use(cors());
 
@@ -75,7 +77,7 @@ app.post("/api/transactions", auth, async (req, res) => {
   try {
     let { amount, category, source, date, note, description } = req.body;
     if (!category && description) {
-      const aiRes = await axios.post("http://localhost:5000/classify", {
+      const aiRes = await axios.post(`${AI_SERVICE_URL}/classify`, {
         description,
       });
       category = aiRes.data.category;
