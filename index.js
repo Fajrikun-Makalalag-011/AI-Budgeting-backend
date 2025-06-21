@@ -14,8 +14,7 @@ const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_ANON_KEY;
 const supabase = createClient(supabaseUrl, supabaseKey);
 const JWT_SECRET = process.env.JWT_SECRET || "aabbccddee1122334455667788991122";
-const AI_SERVICE_URL =
-  process.env.AI_SERVICE_URL || "https://ai-budgeting-ai.domcloud.dev";
+const AI_SERVICE_URL = process.env.AI_SERVICE_URL || "http://localhost:5000";
 
 // Middleware
 app.use(morgan("dev"));
@@ -50,22 +49,62 @@ const errorHandler = (err, req, res, next) => {
 
 // Register
 app.post("/api/register", async (req, res, next) => {
-  const { email, password } = req.body;
+  const {
+    email,
+    password,
+    nama,
+    umur,
+    tempat_tinggal,
+    status_pernikahan,
+    tipe_tempat_tinggal,
+    biaya_tanggungan,
+    punya_kendaraan,
+    nomor_wa,
+    gaji_per_bulan,
+  } = req.body;
+
   try {
-    const { data: existing } = await supabase
-      .from("users")
-      .select("*")
-      .eq("email", email);
-    if (existing && existing.length > 0)
-      return res.status(400).json({ message: "Email already registered" });
-    const hash = await bcrypt.hash(password, 10);
-    const { error } = await supabase
-      .from("users")
-      .insert([{ email, password: hash }]);
-    if (error) throw error;
-    res.status(201).json({ message: "User registered" });
+    // 1. Buat user baru di Supabase Auth
+    const { data: authData, error: authError } = await supabase.auth.signUp({
+      email,
+      password,
+    });
+
+    if (authError) {
+      throw new Error(authError.message);
+    }
+    if (!authData.user) {
+      throw new Error("Registration failed: user not created.");
+    }
+
+    const userId = authData.user.id;
+
+    // 2. Update data di tabel 'profiles' yang sudah otomatis dibuat oleh trigger
+    const { error: profileError } = await supabase
+      .from("profiles")
+      .update({
+        nama,
+        umur,
+        tempat_tinggal,
+        status_pernikahan,
+        tipe_tempat_tinggal,
+        biaya_tanggungan,
+        punya_kendaraan,
+        nomor_wa,
+        gaji_per_bulan,
+        updated_at: new Date(),
+      })
+      .eq("id", userId);
+
+    if (profileError) {
+      // Jika update profil gagal, coba hapus user yang sudah terlanjur dibuat
+      await supabase.auth.admin.deleteUser(userId);
+      throw new Error(`Failed to update profile: ${profileError.message}`);
+    }
+
+    res.status(201).json({ message: "User registered successfully" });
   } catch (err) {
-    next(err);
+    next(err); // Kirim error ke middleware terpusat
   }
 });
 
@@ -73,40 +112,58 @@ app.post("/api/register", async (req, res, next) => {
 app.post("/api/login", async (req, res, next) => {
   const { email, password } = req.body;
   try {
-    const { data: users } = await supabase
-      .from("users")
-      .select("*")
-      .eq("email", email);
-    const user = users && users[0];
-    if (!user) return res.status(400).json({ message: "Invalid credentials" });
-    const valid = await bcrypt.compare(password, user.password);
-    if (!valid) return res.status(400).json({ message: "Invalid credentials" });
-    const token = jwt.sign({ userId: user.id, role: user.role }, JWT_SECRET, {
-      expiresIn: "1d",
+    const { data, error } = await supabase.auth.signInWithPassword({
+      email,
+      password,
     });
-    res.json({ token });
+
+    if (error) {
+      const err = new Error(error.message || "Invalid credentials");
+      err.statusCode = 400;
+      return next(err);
+    }
+
+    if (!data.session) {
+      const err = new Error("Login failed, no session returned.");
+      err.statusCode = 401;
+      return next(err);
+    }
+
+    res.json({ token: data.session.access_token });
   } catch (err) {
-    next(err);
+    next(err); // Kirim error ke middleware terpusat
   }
 });
 
 // Middleware Otentikasi
-function auth(req, res, next) {
-  console.log(`[Auth Middleware] Checking auth for: ${req.method} ${req.path}`);
+async function auth(req, res, next) {
   const authHeader = req.headers.authorization;
-  if (!authHeader) {
-    console.log("[Auth Middleware] Failed: No token provided.");
-    return res.status(401).json({ message: "No token" });
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    const err = new Error("No token provided or invalid format.");
+    err.statusCode = 401;
+    return next(err);
   }
+
   const token = authHeader.split(" ")[1];
   try {
-    const decoded = jwt.verify(token, JWT_SECRET);
-    req.user = decoded;
-    console.log("[Auth Middleware] Success: Token verified.");
+    const {
+      data: { user },
+      error,
+    } = await supabase.auth.getUser(token);
+
+    if (error || !user) {
+      const err = new Error("Invalid or expired token.");
+      err.statusCode = 401;
+      return next(err);
+    }
+
+    // Attach the full user object for more flexibility
+    // and add userId for backward compatibility with existing code.
+    req.user = user;
+    req.user.userId = user.id;
     next();
   } catch (err) {
-    console.log("[Auth Middleware] Failed: Invalid token.", err.message);
-    res.status(401).json({ message: "Invalid token" });
+    next(err);
   }
 }
 
@@ -117,7 +174,8 @@ apiRouter.use(auth);
 // CREATE transaksi (integrasi AI classify)
 apiRouter.post("/transactions", async (req, res, next) => {
   try {
-    let { amount, category, source, date, note, description } = req.body;
+    let { amount, category, source, date, note, description, expense_type } =
+      req.body;
     if (!category && description) {
       const aiRes = await axios.post(`${AI_SERVICE_URL}/classify`, {
         description,
@@ -132,6 +190,7 @@ apiRouter.post("/transactions", async (req, res, next) => {
         source: source || "",
         date,
         note: description,
+        expense_type, // Tambahkan di sini
       },
     ]);
     if (error) throw error;
@@ -164,10 +223,10 @@ apiRouter.get("/transactions", async (req, res, next) => {
 apiRouter.put("/transactions/:id", async (req, res, next) => {
   try {
     const { id } = req.params;
-    const { amount, category, source, date, note } = req.body;
+    const { amount, category, source, date, note, expense_type } = req.body;
     const { data, error } = await supabase
       .from("transactions")
-      .update({ amount, category, source, date, note })
+      .update({ amount, category, source, date, note, expense_type }) // Tambahkan di sini
       .eq("id", id)
       .eq("user_id", req.user.userId)
       .select();
@@ -447,13 +506,14 @@ apiRouter.get("/insight", async (req, res, next) => {
 // Get user profile (email)
 apiRouter.get("/profile", async (req, res, next) => {
   try {
-    const { data: users, error } = await supabase
-      .from("users")
-      .select("email")
-      .eq("id", req.user.userId)
-      .single();
-    if (error) throw error;
-    res.json(users);
+    // The auth middleware now attaches the full user object.
+    // We can get the email directly from it.
+    if (!req.user || !req.user.email) {
+      const err = new Error("User email not found in authentication token.");
+      err.statusCode = 404;
+      return next(err);
+    }
+    res.json({ email: req.user.email });
   } catch (err) {
     next(err);
   }
@@ -493,6 +553,142 @@ apiRouter.post("/goals", async (req, res, next) => {
     next(err);
   }
 });
+
+// CRUD for Payment Sources
+apiRouter
+  .route("/payment-sources")
+  .get(async (req, res, next) => {
+    try {
+      const { data, error } = await supabase
+        .from("payment_sources")
+        .select("*")
+        .eq("user_id", req.user.userId)
+        .order("created_at", { ascending: true });
+      if (error) throw error;
+      res.json(data);
+    } catch (err) {
+      next(err);
+    }
+  })
+  .post(async (req, res, next) => {
+    try {
+      const { name, type } = req.body;
+      if (!name) {
+        return res.status(400).json({ message: "Name is required" });
+      }
+      const { data, error } = await supabase
+        .from("payment_sources")
+        .insert([{ user_id: req.user.userId, name, type }])
+        .select()
+        .single();
+      if (error) throw error;
+      res.status(201).json(data);
+    } catch (err) {
+      next(err);
+    }
+  });
+
+apiRouter
+  .route("/payment-sources/:id")
+  .put(async (req, res, next) => {
+    try {
+      const { id } = req.params;
+      const { name, type } = req.body;
+      if (!name) {
+        return res.status(400).json({ message: "Name is required" });
+      }
+      const { data, error } = await supabase
+        .from("payment_sources")
+        .update({ name, type })
+        .eq("id", id)
+        .eq("user_id", req.user.userId)
+        .select()
+        .single();
+      if (error) throw error;
+      if (!data) return res.status(404).json({ message: "Not found" });
+      res.json(data);
+    } catch (err) {
+      next(err);
+    }
+  })
+  .delete(async (req, res, next) => {
+    try {
+      const { id } = req.params;
+      const { data, error } = await supabase
+        .from("payment_sources")
+        .delete()
+        .eq("id", id)
+        .eq("user_id", req.user.userId)
+        .select()
+        .single();
+      if (error) throw error;
+      if (!data) return res.status(404).json({ message: "Not found" });
+      res.status(204).send(); // No Content
+    } catch (err) {
+      next(err);
+    }
+  });
+
+// Get/Update User Profile Details
+apiRouter
+  .route("/profile-details")
+  .get(async (req, res, next) => {
+    try {
+      const { data, error } = await supabase
+        .from("profiles")
+        .select("*")
+        .eq("id", req.user.userId)
+        .single();
+
+      if (error) throw error;
+
+      // Gabungkan dengan email dari auth user
+      const profileData = { ...data, email: req.user.email };
+      res.json(profileData);
+    } catch (err) {
+      next(err);
+    }
+  })
+  .put(async (req, res, next) => {
+    const { userId } = req.user;
+    const {
+      nama,
+      umur,
+      tempat_tinggal,
+      status_pernikahan,
+      tipe_tempat_tinggal,
+      biaya_tanggungan,
+      punya_kendaraan,
+      nomor_wa,
+      gaji_per_bulan,
+    } = req.body;
+
+    try {
+      const { data, error } = await supabase
+        .from("profiles")
+        .update({
+          nama,
+          umur,
+          tempat_tinggal,
+          status_pernikahan,
+          tipe_tempat_tinggal,
+          biaya_tanggungan,
+          punya_kendaraan,
+          nomor_wa,
+          gaji_per_bulan,
+          updated_at: new Date(),
+        })
+        .eq("id", userId)
+        .select()
+        .single();
+
+      if (error) throw error;
+
+      res.json(data);
+    } catch (err) {
+      next(err);
+    }
+  });
 
 // Gemini AI Budget Analysis
 // Simpan API key Gemini di .env, misal: GEMINI_API_KEY=xxx
@@ -541,6 +737,150 @@ apiRouter.post("/ai-budget-analysis", async (req, res, next) => {
     const insight =
       result.candidates?.[0]?.content?.parts?.[0]?.text || "Tidak ada insight.";
     res.json({ insight });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// AI Budget Plan Generator
+apiRouter.post("/generate-budget", async (req, res, next) => {
+  const { prompt } = req.body;
+  const userId = req.user.userId;
+
+  if (!prompt) {
+    const err = new Error("Prompt is required");
+    err.statusCode = 400;
+    return next(err);
+  }
+
+  try {
+    // 1. Ambil profil user untuk konteks tambahan
+    const { data: profile, error: profileError } = await supabase
+      .from("profiles")
+      .select("*")
+      .eq("id", userId)
+      .single();
+
+    if (profileError || !profile) {
+      const err = new Error("Could not find user profile to create budget.");
+      err.statusCode = 404;
+      return next(err);
+    }
+
+    // 2. Format prompt yang lebih kaya untuk AI
+    const detailedPrompt = `
+      User Profile:
+      - Gaji per bulan: ${new Intl.NumberFormat("id-ID", {
+        style: "currency",
+        currency: "IDR",
+      }).format(profile.gaji_per_bulan)}
+      - Status: ${profile.status_pernikahan}
+      - Biaya Tanggungan: ${profile.biaya_tanggungan}
+      - Tempat Tinggal: ${profile.tipe_tempat_tinggal}
+      - Punya Kendaraan: ${profile.punya_kendaraan ? "Ya" : "Tidak"}
+
+      User Request: "${prompt}"
+
+      Based on the user profile and request above, please provide a monthly budget allocation plan.
+      The output MUST be a valid JSON array of objects. Each object must have three keys:
+      1. "kategori" (string): The budget category.
+      2. "jumlah" (number): The allocated amount.
+      3. "tipe" (string): The expense type, which must be either 'tetap' for fixed expenses or 'variabel' for variable expenses.
+
+      Do not include any explanation or introductory text outside of the JSON array.
+    `;
+
+    // 3. Panggil AI Service (Flask)
+    const aiResponse = await axios.post(`${AI_SERVICE_URL}/generate-plan`, {
+      prompt: detailedPrompt,
+    });
+
+    // Pastikan respons dari AI adalah array
+    if (!Array.isArray(aiResponse.data)) {
+      throw new Error("Invalid response format from AI service.");
+    }
+
+    const budgetPlan = aiResponse.data;
+
+    // 4. (Opsional, tapi direkomendasikan) Simpan hasil ke database
+    const now = new Date();
+    const budgetRecords = budgetPlan.map((item) => ({
+      user_id: userId,
+      kategori: item.kategori,
+      jumlah: item.jumlah,
+      bulan: now.getMonth() + 1, // Bulan (1-12)
+      tahun: now.getFullYear(),
+    }));
+
+    const { error: insertError } = await supabase
+      .from("generated_budgets")
+      .insert(budgetRecords);
+
+    if (insertError) {
+      // Tidak melempar error fatal jika hanya gagal menyimpan, tapi catat di log
+      console.error("Failed to save generated budget:", insertError.message);
+    }
+
+    // 5. Kirim hasil kembali ke frontend
+    res.json(budgetPlan);
+  } catch (err) {
+    // Tangani error dari axios atau lainnya
+    if (axios.isAxiosError(err)) {
+      console.error("AI Service Error:", err.response?.data);
+      const newErr = new Error("Failed to get response from AI service.");
+      newErr.statusCode = err.response?.status || 500;
+      return next(newErr);
+    }
+    next(err);
+  }
+});
+
+// Save Generated Budget Plan
+apiRouter.post("/save-budget-plan", async (req, res, next) => {
+  try {
+    const { plan } = req.body;
+    const { userId } = req.user;
+
+    // Defensive check: Pastikan userId ada
+    if (!userId) {
+      const err = new Error("Authentication error: User ID is missing.");
+      err.statusCode = 401; // Unauthorized
+      return next(err);
+    }
+
+    if (!plan || !Array.isArray(plan)) {
+      const err = new Error("Invalid budget plan data.");
+      err.statusCode = 400;
+      return next(err);
+    }
+
+    // 1. Hapus semua pengaturan budget yang ada untuk user ini agar tidak tumpang tindih
+    const { error: deleteError } = await supabase
+      .from("budget_settings")
+      .delete()
+      .eq("user_id", userId);
+
+    if (deleteError) {
+      throw new Error(`Failed to clear old budget: ${deleteError.message}`);
+    }
+
+    // 2. Format data baru dan sisipkan
+    const dataToInsert = plan.map((item) => ({
+      user_id: userId,
+      category: item.kategori,
+      budget_limit: item.jumlah,
+      expense_type: item.tipe,
+    }));
+
+    const { error: insertError } = await supabase
+      .from("budget_settings")
+      .insert(dataToInsert);
+
+    if (insertError) {
+      throw new Error(`Failed to save budget plan: ${insertError.message}`);
+    }
+
+    res.status(200).json({ message: "Budget plan saved successfully." });
   } catch (err) {
     next(err);
   }
