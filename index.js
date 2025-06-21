@@ -1,6 +1,8 @@
-require("dotenv").config();
+const path = require("path");
+require("dotenv").config({ path: path.resolve(__dirname, ".env") });
 const express = require("express");
 const cors = require("cors");
+const morgan = require("morgan");
 const app = express();
 const PORT = process.env.PORT || 3001;
 const { createClient } = require("@supabase/supabase-js");
@@ -11,14 +13,43 @@ const axios = require("axios");
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_ANON_KEY;
 const supabase = createClient(supabaseUrl, supabaseKey);
-const JWT_SECRET = process.env.JWT_SECRET || "secretkey123";
+const JWT_SECRET = process.env.JWT_SECRET || "aabbccddee1122334455667788991122";
 const AI_SERVICE_URL =
   process.env.AI_SERVICE_URL || "https://ai-budgeting-ai.domcloud.dev";
+
+// Middleware
+app.use(morgan("dev"));
 app.use(express.json());
-app.use(cors());
+app.use(
+  cors({
+    origin: "*", // Izinkan semua origin (bisa diganti dengan URL frontend Anda)
+    methods: ["GET", "POST", "PUT", "DELETE"], // Izinkan metode DELETE
+    allowedHeaders: ["Content-Type", "Authorization"], // Izinkan header Authorization
+  })
+);
+
+// Middleware Error Handling Terpusat
+const errorHandler = (err, req, res, next) => {
+  console.error("==================== ERROR ====================");
+  console.error("Timestamp:", new Date().toISOString());
+  console.error("Route:", `${req.method} ${req.originalUrl}`);
+  console.error("Body:", JSON.stringify(req.body, null, 2));
+  console.error("Error Message:", err.message);
+  console.error("Error Stack:", err.stack);
+  console.error("==============================================");
+
+  // Jangan kirim stack trace ke client di production
+  const status = err.statusCode || 500;
+  const message = err.message || "Internal Server Error";
+  res.status(status).json({
+    message,
+    // Hanya sertakan stack di environment development
+    ...(process.env.NODE_ENV === "development" && { stack: err.stack }),
+  });
+};
 
 // Register
-app.post("/api/register", async (req, res) => {
+app.post("/api/register", async (req, res, next) => {
   const { email, password } = req.body;
   try {
     const { data: existing } = await supabase
@@ -30,16 +61,16 @@ app.post("/api/register", async (req, res) => {
     const hash = await bcrypt.hash(password, 10);
     const { error } = await supabase
       .from("users")
-      .insert([{ email, password: hash, role: "user" }]);
-    if (error) return res.status(400).json({ message: error.message });
+      .insert([{ email, password: hash }]);
+    if (error) throw error;
     res.status(201).json({ message: "User registered" });
   } catch (err) {
-    res.status(500).json({ message: "Server error" });
+    next(err);
   }
 });
 
 // Login
-app.post("/api/login", async (req, res) => {
+app.post("/api/login", async (req, res, next) => {
   const { email, password } = req.body;
   try {
     const { data: users } = await supabase
@@ -55,25 +86,36 @@ app.post("/api/login", async (req, res) => {
     });
     res.json({ token });
   } catch (err) {
-    res.status(500).json({ message: "Server error" });
+    next(err);
   }
 });
 
+// Middleware Otentikasi
 function auth(req, res, next) {
+  console.log(`[Auth Middleware] Checking auth for: ${req.method} ${req.path}`);
   const authHeader = req.headers.authorization;
-  if (!authHeader) return res.status(401).json({ message: "No token" });
+  if (!authHeader) {
+    console.log("[Auth Middleware] Failed: No token provided.");
+    return res.status(401).json({ message: "No token" });
+  }
   const token = authHeader.split(" ")[1];
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
     req.user = decoded;
+    console.log("[Auth Middleware] Success: Token verified.");
     next();
-  } catch {
+  } catch (err) {
+    console.log("[Auth Middleware] Failed: Invalid token.", err.message);
     res.status(401).json({ message: "Invalid token" });
   }
 }
 
+// == RUTE TERPROTEKSI (Memerlukan Otentikasi) ==
+const apiRouter = express.Router();
+apiRouter.use(auth);
+
 // CREATE transaksi (integrasi AI classify)
-app.post("/api/transactions", auth, async (req, res) => {
+apiRouter.post("/transactions", async (req, res, next) => {
   try {
     let { amount, category, source, date, note, description } = req.body;
     if (!category && description) {
@@ -87,20 +129,20 @@ app.post("/api/transactions", auth, async (req, res) => {
         user_id: req.user.userId,
         amount,
         category: category || "Other",
-        source,
+        source: source || "",
         date,
-        note,
+        note: description,
       },
     ]);
-    if (error) return res.status(400).json({ message: error.message });
+    if (error) throw error;
     res.status(201).json({ message: "Transaction created" });
   } catch (err) {
-    res.status(500).json({ message: "Server error", error: err.message });
+    next(err);
   }
 });
 
 // READ (list) transaksi user (filter kategori/tanggal opsional)
-app.get("/api/transactions", auth, async (req, res) => {
+apiRouter.get("/transactions", async (req, res, next) => {
   try {
     const { category, start, end } = req.query;
     let query = supabase
@@ -111,15 +153,15 @@ app.get("/api/transactions", auth, async (req, res) => {
     if (start) query = query.gte("date", start);
     if (end) query = query.lte("date", end);
     const { data, error } = await query.order("date", { ascending: false });
-    if (error) return res.status(400).json({ message: error.message });
+    if (error) throw error;
     res.json(data);
   } catch (err) {
-    res.status(500).json({ message: "Server error" });
+    next(err);
   }
 });
 
 // UPDATE transaksi
-app.put("/api/transactions/:id", auth, async (req, res) => {
+apiRouter.put("/transactions/:id", async (req, res, next) => {
   try {
     const { id } = req.params;
     const { amount, category, source, date, note } = req.body;
@@ -129,17 +171,17 @@ app.put("/api/transactions/:id", auth, async (req, res) => {
       .eq("id", id)
       .eq("user_id", req.user.userId)
       .select();
-    if (error) return res.status(400).json({ message: error.message });
+    if (error) throw error;
     if (!data || data.length === 0)
       return res.status(404).json({ message: "Not found" });
     res.json(data[0]);
   } catch (err) {
-    res.status(500).json({ message: "Server error" });
+    next(err);
   }
 });
 
 // DELETE transaksi
-app.delete("/api/transactions/:id", auth, async (req, res) => {
+apiRouter.delete("/transactions/:id", async (req, res, next) => {
   try {
     const { id } = req.params;
     const { data, error } = await supabase
@@ -148,31 +190,63 @@ app.delete("/api/transactions/:id", auth, async (req, res) => {
       .eq("id", id)
       .eq("user_id", req.user.userId)
       .select();
-    if (error) return res.status(400).json({ message: error.message });
+    if (error) throw error;
     if (!data || data.length === 0)
       return res.status(404).json({ message: "Not found" });
     res.json({ message: "Deleted" });
   } catch (err) {
-    res.status(500).json({ message: "Server error" });
+    next(err);
+  }
+});
+
+// DELETE SEMUA transaksi user
+apiRouter.delete("/transactions/all", async (req, res, next) => {
+  try {
+    console.log("[Handler] Entered /api/transactions/all logic.");
+    // Langkah 1: Dapatkan semua ID transaksi milik user
+    const { data: transactions, error: selectError } = await supabase
+      .from("transactions")
+      .select("id")
+      .eq("user_id", req.user.userId);
+
+    if (selectError) throw selectError;
+
+    if (!transactions || transactions.length === 0) {
+      return res.json({ message: "No transactions to delete." });
+    }
+
+    const transactionIds = transactions.map((tx) => tx.id);
+
+    // Langkah 2: Hapus transaksi berdasarkan ID yang didapat
+    const { error: deleteError } = await supabase
+      .from("transactions")
+      .delete()
+      .in("id", transactionIds);
+
+    if (deleteError) throw deleteError;
+
+    res.json({ message: "All transactions deleted" });
+  } catch (err) {
+    next(err);
   }
 });
 
 // GET semua budget setting user
-app.get("/api/budgets", auth, async (req, res) => {
+apiRouter.get("/budgets", async (req, res, next) => {
   try {
     const { data, error } = await supabase
       .from("budget_settings")
       .select("*")
       .eq("user_id", req.user.userId);
-    if (error) return res.status(400).json({ message: error.message });
+    if (error) throw error;
     res.json(data);
   } catch (err) {
-    res.status(500).json({ message: "Server error" });
+    next(err);
   }
 });
 
 // SET/UPDATE budget setting per kategori
-app.post("/api/budgets", auth, async (req, res) => {
+apiRouter.post("/budgets", async (req, res, next) => {
   try {
     const { category, limit } = req.body;
     if (!category || !limit)
@@ -187,15 +261,15 @@ app.post("/api/budgets", auth, async (req, res) => {
       .from("budget_settings")
       .insert([{ user_id: req.user.userId, category, budget_limit: limit }])
       .select();
-    if (error) return res.status(400).json({ message: error.message });
+    if (error) throw error;
     res.json(data[0]);
   } catch (err) {
-    res.status(500).json({ message: "Server error" });
+    next(err);
   }
 });
 
 // ALERT: cek jika pengeluaran kategori bulan ini melebihi limit
-app.get("/api/budgets/alert", auth, async (req, res) => {
+apiRouter.get("/budgets/alert", async (req, res, next) => {
   try {
     const { data: budgets, error: err1 } = await supabase
       .from("budget_settings")
@@ -214,8 +288,7 @@ app.get("/api/budgets/alert", auth, async (req, res) => {
       .eq("user_id", req.user.userId)
       .gte("date", start)
       .lte("date", end);
-    if (err1 || err2)
-      return res.status(400).json({ message: (err1 || err2).message });
+    if (err1 || err2) throw err1 || err2;
     const alert = budgets.map((b) => {
       const spent = txs
         .filter((t) => t.category === b.category)
@@ -230,7 +303,7 @@ app.get("/api/budgets/alert", auth, async (req, res) => {
     });
     res.json(alert);
   } catch (err) {
-    res.status(500).json({ message: "Server error" });
+    next(err);
   }
 });
 
@@ -238,7 +311,7 @@ app.get("/api/budgets/alert", auth, async (req, res) => {
 const isExpense = (t) => t.category && t.category.toLowerCase() !== "income";
 
 // AI Insight Advanced Endpoint
-app.get("/api/insight", auth, async (req, res) => {
+apiRouter.get("/insight", async (req, res, next) => {
   try {
     const now = new Date();
     const start = new Date(now.getFullYear(), now.getMonth(), 1)
@@ -367,31 +440,27 @@ app.get("/api/insight", auth, async (req, res) => {
     }
     res.json(insights);
   } catch (err) {
-    res
-      .status(500)
-      .json({ message: "Gagal mengambil insight", error: err.message });
+    next(err);
   }
 });
 
 // Get user profile (email)
-app.get("/api/profile", auth, async (req, res) => {
+apiRouter.get("/profile", async (req, res, next) => {
   try {
     const { data: users, error } = await supabase
       .from("users")
       .select("email")
       .eq("id", req.user.userId)
       .single();
-    if (error) return res.status(400).json({ message: error.message });
+    if (error) throw error;
     res.json(users);
   } catch (err) {
-    res
-      .status(500)
-      .json({ message: "Gagal mengambil profil user", error: err.message });
+    next(err);
   }
 });
 
 // GET goal user
-app.get("/api/goals", auth, async (req, res) => {
+apiRouter.get("/goals", async (req, res, next) => {
   try {
     const { data, error } = await supabase
       .from("goals")
@@ -403,12 +472,12 @@ app.get("/api/goals", auth, async (req, res) => {
       return res.status(400).json({ message: error.message });
     res.json({ goal: data ? data.goal : "" });
   } catch (err) {
-    res.status(500).json({ message: "Server error" });
+    next(err);
   }
 });
 
 // SET/UPDATE goal user
-app.post("/api/goals", auth, async (req, res) => {
+apiRouter.post("/goals", async (req, res, next) => {
   try {
     const { goal } = req.body;
     if (!goal) return res.status(400).json({ message: "Goal required" });
@@ -418,10 +487,10 @@ app.post("/api/goals", auth, async (req, res) => {
       .from("goals")
       .insert([{ user_id: req.user.userId, goal }])
       .select();
-    if (error) return res.status(400).json({ message: error.message });
+    if (error) throw error;
     res.json(data[0]);
   } catch (err) {
-    res.status(500).json({ message: "Server error" });
+    next(err);
   }
 });
 
@@ -431,17 +500,22 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_API_URL =
   "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent";
 
-app.post("/api/ai-budget-analysis", auth, async (req, res) => {
+apiRouter.post("/ai-budget-analysis", async (req, res, next) => {
   try {
-    if (!GEMINI_API_KEY)
-      return res.status(500).json({ message: "Gemini API key not set" });
+    if (!GEMINI_API_KEY) {
+      const err = new Error("Gemini API key not set");
+      err.statusCode = 500;
+      throw err;
+    }
     const { transactions } = req.body;
     if (
       !transactions ||
       !Array.isArray(transactions) ||
       transactions.length === 0
     ) {
-      return res.status(400).json({ message: "No transactions provided" });
+      const err = new Error("No transactions provided");
+      err.statusCode = 400;
+      throw err;
     }
     // Format prompt
     const prompt = `Analisa data transaksi berikut dan berikan insight budgeting dalam bahasa Indonesia. Tampilkan hasil dalam format markdown yang rapi dan terstruktur (gunakan judul, bullet, tabel jika perlu, dan penjelasan singkat).\n\nData transaksi:\n${JSON.stringify(
@@ -457,8 +531,10 @@ app.post("/api/ai-budget-analysis", auth, async (req, res) => {
       }),
     });
     if (!response.ok) {
-      const err = await response.text();
-      return res.status(500).json({ message: "Gemini API error", error: err });
+      const errorText = await response.text();
+      const err = new Error(`Gemini API error: ${errorText}`);
+      err.statusCode = 500;
+      throw err;
     }
     const result = await response.json();
     // Ambil insight dari response Gemini
@@ -466,9 +542,65 @@ app.post("/api/ai-budget-analysis", auth, async (req, res) => {
       result.candidates?.[0]?.content?.parts?.[0]?.text || "Tidak ada insight.";
     res.json({ insight });
   } catch (err) {
-    res.status(500).json({ message: "Server error", error: err.message });
+    next(err);
   }
 });
+
+// DELETE SEMUA DATA USER (TRANSACTIONS, BUDGETS, GOALS)
+apiRouter.delete("/user-data/all", async (req, res, next) => {
+  try {
+    const userId = req.user.userId;
+
+    // 1. Hapus semua transaksi
+    const { error: txError } = await supabase
+      .from("transactions")
+      .delete()
+      .eq("user_id", userId);
+
+    if (txError) {
+      throw new Error(`Failed to delete transactions: ${txError.message}`);
+    }
+
+    // 2. Hapus semua pengaturan budget
+    const { error: budgetError } = await supabase
+      .from("budget_settings")
+      .delete()
+      .eq("user_id", userId);
+
+    if (budgetError) {
+      throw new Error(
+        `Failed to delete budget settings: ${budgetError.message}`
+      );
+    }
+
+    // 3. Hapus semua goals
+    const { error: goalError } = await supabase
+      .from("goals")
+      .delete()
+      .eq("user_id", userId);
+
+    if (goalError) {
+      throw new Error(`Failed to delete goals: ${goalError.message}`);
+    }
+
+    res.json({ message: "All user data has been successfully deleted." });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Gunakan router untuk semua rute API yang terproteksi
+app.use("/api", apiRouter);
+
+// Handler untuk rute tidak ditemukan (404)
+app.use((req, res, next) => {
+  const error = new Error(`Not Found - ${req.originalUrl}`);
+  error.statusCode = 404;
+  next(error);
+});
+
+// Terapkan middleware error handling sebagai middleware terakhir
+app.use(errorHandler);
 
 app.get("/", (req, res) => {
   res.send("Backend is running with Supabase JS Client!");
